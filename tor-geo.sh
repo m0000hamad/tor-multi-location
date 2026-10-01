@@ -10,7 +10,7 @@
 
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 RAW_URL=https://raw.githubusercontent.com/m0000hamad/tor-multi-location/main/tor-geo.sh
 
 BIN=/usr/local/bin/tor-geo
@@ -331,21 +331,68 @@ cmd_uninstall() {
 
 # ------------------------------------------------------------------ nodes ----
 
-add_one() {  # add_one <cc> -> prints name
-  local cc=$1 name port
+# Bootstrapping means downloading ~10k relay descriptors, which on some links
+# takes minutes. Every node needs the same data, so a new node starts from a
+# copy of an existing node's directory cache and only fetches what changed.
+SEED_FILES=(cached-certs cached-microdesc-consensus cached-microdescs cached-microdescs.new)
+
+seed_source() {  # node with the freshest usable directory cache, or nothing
+  local n f t newest=0 best=""
+  for n in $(node_names); do
+    f=$STATE_ROOT/$n/cached-microdesc-consensus
+    [[ -s $f && -s $STATE_ROOT/$n/cached-certs ]] || continue
+    t=$(stat -c %Y "$f")
+    if ((t > newest)); then newest=$t; best=$n; fi
+  done
+  echo "$best"
+}
+
+seed_dir() {  # seed_dir <new-name> -> prints the node it copied from, if any
+  local dst=$STATE_ROOT/$1 src f
+  src=$(seed_source)
+  [[ -n $src && $src != "$1" ]] || return 0
+  mkdir -p "$dst"
+  for f in "${SEED_FILES[@]}"; do
+    if [[ -f $STATE_ROOT/$src/$f ]]; then cp "$STATE_ROOT/$src/$f" "$dst/"; fi
+  done
+  chown -R "$TOR_USER:$TOR_USER" "$dst"
+  chmod 700 "$dst"
+  echo "$src"
+}
+
+wait_boot() {  # wait_boot <name> <seconds>: until Tor reports 100%
+  local deadline=$((SECONDS + $2))
+  while ((SECONDS < deadline)); do
+    (($(boot_pct "$1") >= 100)) && return 0
+    sleep 5
+  done
+  return 1
+}
+
+add_one() {  # add_one <cc> -> prints "<name> <seed-source>"
+  local cc=$1 name port src
   name=$(next_name "$cc")
   port=$(next_port)
   render_torrc "$name" "$cc" "$port"
+  src=$(seed_dir "$name")
   if ! systemctl enable --now "tor-geo@$name" >/dev/null 2>&1; then
     rm -f "$NODES_DIR/$name.torrc"
     die "tor-geo@$name failed to start: journalctl -u tor-geo@$name"
   fi
-  echo "$name"
+  echo "$name $src"
+}
+
+start_node() {  # start_node <cc>: add_one + report; appends to $added
+  local name src
+  read -r name src <<<"$(add_one "$1")"
+  [[ -n $name ]] || exit 1
+  added+=("$name")
+  ok "$name  ($(cc_label "$1"))  socks5://$(probe_host):$(node_port "$name")${src:+  ${C_D}[cache from $src]${C_0}}"
 }
 
 cmd_add() {
   need_root; need_installed
-  local force=0 arg cc count exits i name counts added=() picked=()
+  local force=0 arg cc count exits i name counts added=() picked=() todo=()
   if [[ ${1:-} == --force ]]; then force=1; shift; fi
   [[ $# -gt 0 ]] || die "usage: tor-geo add [--force] <cc>[:count] ...   e.g. tor-geo add de nl:2 us
        tor-geo add --top 10"
@@ -371,15 +418,22 @@ cmd_add() {
       fi
       ((${exits:-0} < 5)) && warn "$cc has only ${exits:-0} exit relay(s): expect slow and repeated IPs"
     fi
-    for ((i = 0; i < count; i++)); do
-      name=$(add_one "$cc")
-      added+=("$name")
-      ok "$name  ($(cc_label "$cc"))  socks5://$(probe_host):$(node_port "$name")"
-    done
+    for ((i = 0; i < count; i++)); do todo+=("$cc"); done
   done
+  ((${#todo[@]})) || return 0
 
-  ((${#added[@]})) || return 0
-  info "waiting for ${#added[@]} node(s) to bootstrap (first start can take ~3 min)"
+  # Nothing to copy a directory cache from yet: bootstrap one node first so
+  # the others don't each download the whole directory in parallel.
+  if [[ -z $(seed_source) && ${#todo[@]} -gt 1 ]]; then
+    start_node "${todo[0]}"
+    info "${added[0]} downloads the Tor directory once, the other nodes will copy it"
+    wait_boot "${added[0]}" "$BOOT_LIMIT" ||
+      warn "${added[0]} did not finish bootstrapping; starting the rest without a cache"
+    todo=("${todo[@]:1}")
+  fi
+  for cc in "${todo[@]}"; do start_node "$cc"; done
+
+  info "waiting for ${#added[@]} node(s) to get a working exit"
   local dir; dir=$(mktemp -d)
   for name in "${added[@]}"; do
     ( wait_ready "$name" 200 > "$dir/$name" || true ) &
@@ -588,7 +642,34 @@ cmd_bridges() {
 
 # ----------------------------------------------------------------- export ----
 
-exit_counts() {  # "<count> <cc>" for countries with running exits, most first
+# "<count> <cc>" for countries with running exits, most first. Reads the
+# consensus a node already downloaded (works where torproject.org is blocked,
+# and is exactly what Tor itself sees); falls back to onionoo before the first
+# node exists.
+exit_counts() {
+  exit_counts_local || exit_counts_onionoo
+}
+
+exit_counts_local() {
+  local src out
+  src=$(seed_source)
+  [[ -n $src && -r $GEOIP ]] || return 1
+  # Load GeoIP ranges, then binary-search the IP of every relay flagged Exit.
+  out=$(awk '
+    FNR == NR { if ($0 !~ /^#/) { split($0, a, ","); lo[n] = a[1] + 0; hi[n] = a[2] + 0; cc[n] = tolower(a[3]); n++ }; next }
+    /^r / { ip = $6; next }
+    /^s / && / Exit/ && !/BadExit/ {
+      split(ip, o, "."); v = o[1] * 16777216 + o[2] * 65536 + o[3] * 256 + o[4]
+      l = 0; h = n - 1; c = "??"
+      while (l <= h) { m = int((l + h) / 2); if (v < lo[m]) h = m - 1; else if (v > hi[m]) l = m + 1; else { c = cc[m]; break } }
+      count[c]++
+    }
+    END { for (c in count) print count[c], c }
+  ' "$GEOIP" "$STATE_ROOT/$src/cached-microdesc-consensus" | sort -rn)
+  [[ -n $out ]] && echo "$out"
+}
+
+exit_counts_onionoo() {
   curl -fsS --max-time 20 \
     'https://onionoo.torproject.org/details?type=relay&running=true&flag=Exit&fields=country' |
     jq -r '.relays | map(.country // "??") | group_by(.) | map("\(length) \(.[0])") | .[]' |
@@ -596,8 +677,9 @@ exit_counts() {  # "<count> <cc>" for countries with running exits, most first
 }
 
 cmd_countries() {
-  info "asking onionoo.torproject.org for running exit relays…"
-  local data; data=$(exit_counts) || die "could not reach onionoo.torproject.org"
+  local data
+  data=$(exit_counts) || die "no node has a Tor directory yet and onionoo.torproject.org is unreachable.
+       Add a node first (tor-geo add de); if Tor itself is blocked here, set bridges (tor-geo bridges)."
   printf '%-4s %-18s %s\n' CC COUNTRY EXITS
   local n cc
   while read -r n cc; do

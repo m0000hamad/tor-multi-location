@@ -95,8 +95,13 @@ the distro has them. `snowflake` works if `snowflake-client` is installed.
 - Tor carries TCP only. No UDP, so no QUIC, no voice/video calls.
 - Each node uses about 100 MB RAM (measured with Tor 0.4.9). Plan around
   1 GB for 10 nodes, 5 GB for 50.
-- The first start of a node downloads the Tor directory and can take a few
-  minutes on a slow link. Restarts are faster.
+- The first node downloads the Tor directory (~40 MB), which can take a few
+  minutes on a slow link. Every later node starts from a copy of that cache
+  and is ready in seconds. When you add several nodes at once on an empty
+  server, the first one bootstraps alone and the rest copy its cache.
+- `countries` reads the consensus a node already downloaded, so it works even
+  where torproject.org is blocked. Before the first node exists it asks
+  onionoo.torproject.org instead.
 - `tor-geo check` reports the country from Tor's own GeoIP database, the same
   one `ExitNodes` uses, so it confirms the pinning works without calling an
   external API.
