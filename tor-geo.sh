@@ -34,6 +34,7 @@ CHECK_URL=https://api.ipify.org # must return the plain exit IP
 PROBE_TIMEOUT=25                # seconds per health probe
 HEAL_FAILS=2                    # consecutive failed probes before a restart
 BOOT_GRACE=120                  # seconds after start before heal judges a node
+BOOT_LIMIT=1200                 # max seconds a node may spend bootstrapping
 
 # shellcheck source=/dev/null
 [[ -f $CONF ]] && source "$CONF"
@@ -171,6 +172,22 @@ wait_ready() {  # wait_ready <name> [seconds] -> prints exit IP
   return 1
 }
 
+boot_pct() {  # Tor bootstrap progress (0-100) of the node's current run
+  local inv; inv=$(systemctl show -p InvocationID --value "tor-geo@$1")
+  [[ -n $inv ]] || { echo 0; return; }
+  journalctl _SYSTEMD_INVOCATION_ID="$inv" -o cat --no-pager 2>/dev/null |
+    grep -o 'Bootstrapped [0-9]*' | tail -n 1 | grep -o '[0-9]*$' || echo 0
+}
+
+why_down() {  # short reason a node gives no exit IP
+  local pct; pct=$(boot_pct "$1")
+  if ((pct < 100)); then
+    echo "still bootstrapping ($pct%) — slow link or Tor blocked (see: tor-geo bridges)"
+  else
+    echo "bootstrapped, but no working exit circuit — few exits in $(node_cc "$1")?"
+  fi
+}
+
 since_active() {  # seconds since the unit last entered "active"
   local mono up
   mono=$(systemctl show "tor-geo@$1" -p ActiveEnterTimestampMonotonic --value)
@@ -240,6 +257,7 @@ CHECK_URL=$CHECK_URL
 PROBE_TIMEOUT=$PROBE_TIMEOUT
 HEAL_FAILS=$HEAL_FAILS
 BOOT_GRACE=$BOOT_GRACE
+BOOT_LIMIT=$BOOT_LIMIT
 EOF
 }
 
@@ -372,7 +390,7 @@ cmd_add() {
     if [[ -n $ip ]]; then
       ok "$name ready — exit IP $ip"
     else
-      warn "$name not ready yet. Few exits in $(node_cc "$name")? Check: tor-geo logs $name"
+      warn "$name not ready: $(why_down "$name"). Re-test later: tor-geo check"
     fi
   done
   rm -rf "$dir"
@@ -459,7 +477,7 @@ cmd_check() {  # live probe of every node, in parallel
       mark=""; [[ $geo != "$cc" && $geo != "?" ]] && mark=" ${C_Y}(exit is not in $cc!)${C_0}"
       printf '%-8s %-3s %-6s %s %-40s %-4s %sms%s\n' "$n" "$cc" "$(node_port "$n")" "${C_G}ok    ${C_0}" "$ip" "$geo" "$ms" "$mark"
     else
-      printf '%-8s %-3s %-6s %s\n' "$n" "$cc" "$(node_port "$n")" "${C_R}FAIL${C_0}   (tor-geo logs $n)"
+      printf '%-8s %-3s %-6s %s\n' "$n" "$cc" "$(node_port "$n")" "${C_R}FAIL${C_0}   $(why_down "$n")"
     fi
   done
   rm -rf "$dir"
@@ -473,18 +491,26 @@ cmd_heal() {
   mkdir -p "$RUN_DIR"
   for n in $(node_names); do
     (
-      local fails ip
+      local fails ip pct up
       if ! systemctl is-active --quiet "tor-geo@$n"; then
         logger -t tor-geo "$n inactive, starting"
         systemctl start "tor-geo@$n" || true
         exit
       fi
-      (( $(since_active "$n") < BOOT_GRACE )) && exit
+      up=$(since_active "$n")
+      ((up < BOOT_GRACE)) && exit
       if ip=$(probe "$n"); then
         echo "$ip" > "$RUN_DIR/$n.ip"
         rm -f "$RUN_DIR/$n.fails"
         ((quiet)) || ok "$n $ip"
       else
+        # A restart mid-bootstrap only throws the progress away. Give a slow
+        # first download BOOT_LIMIT seconds before treating the node as stuck.
+        pct=$(boot_pct "$n")
+        if ((pct < 100 && up < BOOT_LIMIT)); then
+          ((quiet)) || info "$n still bootstrapping ($pct%)"
+          exit
+        fi
         fails=$(( $(cat "$RUN_DIR/$n.fails" 2>/dev/null || echo 0) + 1 ))
         if ((fails >= HEAL_FAILS)); then
           logger -t tor-geo "$n failed $fails probes, restarting"
@@ -563,7 +589,7 @@ cmd_bridges() {
 # ----------------------------------------------------------------- export ----
 
 exit_counts() {  # "<count> <cc>" for countries with running exits, most first
-  curl -fsS --max-time 60 \
+  curl -fsS --max-time 20 \
     'https://onionoo.torproject.org/details?type=relay&running=true&flag=Exit&fields=country' |
     jq -r '.relays | map(.country // "??") | group_by(.) | map("\(length) \(.[0])") | .[]' |
     sort -rn
